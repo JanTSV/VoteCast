@@ -164,11 +164,13 @@ class Server:
         neighbor = self.left if direction == "LEFT" else self.right
 
         if cid < self.id:
-            # TODO: Something is wrong, a server with lower ID cannot start an election because of this
+            # Swallow message from lower IDs or start own election
+            if not self.election_in_progress:
+                self.__hs_start()
             return
         
         if hop > 1:
-            hop -= 1
+            msg["hop"] -= 1
             self.__send(neighbor, msg)
         else:
             reply = {
@@ -197,8 +199,7 @@ class Server:
         neighbor = self.left if direction == "LEFT" else self.right
 
         if cid != self.id:
-            if neighbor != self.id:
-                self.__send(neighbor, msg)
+            self.__send(neighbor, msg)
             return
         
         self.pending_replies -= 1
@@ -212,10 +213,10 @@ class Server:
 
     def __hs_declare_leader(self):
         self.__log("HS: I am the leader")
-        msg = {"type": "HS_LEADER", "id": self.id}
         self.leader = self.id
         self.is_leader = True
         self.election_in_progress = False
+        msg = {"type": "HS_LEADER", "id": self.id}
         self.__send(self.left, msg)
 
     def __hs_leader(self, msg):
@@ -223,9 +224,6 @@ class Server:
         
         if cid is None:
             self.__log(f"Error: Expected key 'id': {msg}")
-            return
-
-        if self.leader is not None:
             return
 
         self.leader = cid
