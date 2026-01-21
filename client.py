@@ -1,7 +1,6 @@
 import socket
 import json
 import uuid
-import time
 
 from config import MCAST_GRP, MCAST_PORT, BUF
 
@@ -10,6 +9,8 @@ class Client:
     def __init__(self):
         # Own communication
         self.id = str(uuid.uuid4())
+        self.__log(f"ID: {self.id}")
+
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.settimeout(2)
 
@@ -22,6 +23,14 @@ class Client:
     def __send_leader_request(self):
         # Send request to server multicast group
         self.sock.sendto("WHO_IS_LEADER".encode(), (MCAST_GRP, MCAST_PORT))
+
+    def __send(self, msg):
+        if self.leader is None:
+            self.__log("Error: No leader")
+
+        # Send request to leader server
+        ip, port = self.leader.split(":")
+        self.sock.sendto(json.dumps(msg).encode(), (ip, int(port)))
 
     def discover_leader(self):
         self.__log("Requesting leader via multicast...")
@@ -43,6 +52,8 @@ class Client:
 
         self.__log(f"Leader is {self.leader}")
 
+    def __get_groups(self):
+        self.__send({ "type": "GET_GROUPS" })
 
     def run(self):
         if self.leader is None:
@@ -54,21 +65,25 @@ class Client:
             print("1) Show leader")
             print("2) Show available groups")
             print("3) Show joined groups")
-            print("4) Start vote")
-            print("5) Exit")
+            print("4) Create group")
+            print("5) Start vote")
+            print("6) Exit")
             choice = int(input("Choose: "))
             if choice == 1:
                 print(f"Leader: {self.leader}")
             elif choice == 2:
-                pass
+                self.__get_groups()
             elif choice == 3:
                 pass
             elif choice == 4:
                 return
             elif choice == 5:
                 return
+            elif choice == 6:
+                return
             else:
                 print("Invalid choice")
+
 
 if __name__ == "__main__":
     client = Client()

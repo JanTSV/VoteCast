@@ -248,7 +248,7 @@ class Server:
             self.__log("Got: HS_LEADER")
             self.__hs_leader(msg)
         else:
-            self.__log("Error: Got invalid message")
+            self.__log(f"Error: Got invalid message: {msg}")
 
     def __message_handling(self):
         while not self.stop_event.is_set():
