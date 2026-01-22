@@ -97,7 +97,12 @@ class Client:
                 continue
 
     def __get_groups(self):
-        self.__send({ "type": "GET_GROUPS" })
+        self.__send({
+            "type": "GET_GROUPS",
+            "id": self.id,
+            "token": self.token
+        })
+        print(self.__recv())
 
     def run(self):
         if self.leader is None:

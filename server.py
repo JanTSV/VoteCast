@@ -298,6 +298,12 @@ class Server:
         
         self.__send(addr, {"type": "CREATE_GROUP_OK", "group": name})
 
+    @requires_auth
+    def __get_groups(self, msg, addr):
+        groups = [g for g in self.groups.keys()]
+        print(groups)
+        self.__send(addr, {"type": "GET_GROUPS_OK", "groups": groups})
+
     def __handle_message(self, msg, addr):
         t = msg.get("type")
         if t == "HS_ELECTION":
@@ -315,6 +321,9 @@ class Server:
         elif t == "CREATE_GROUP":
             self.__log("Got: CREATE_GROUP")
             self.__create_group(msg, addr)
+        elif t == "GET_GROUPS":
+            self.__log("Got: GET_GROUPS")
+            self.__get_groups(msg, addr)
         else:
             self.__log(f"Error: Got invalid message: {msg}")
 
