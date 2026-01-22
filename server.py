@@ -18,6 +18,15 @@ def get_local_ip():
         s.close()
 
 
+def requires_auth(fn):
+    def wrapper(self, msg, addr):
+        if not self.is_authenticated(msg):
+            self.send_error(addr, "AUTH_FAILED")
+            return
+        return fn(self, msg, addr)
+    return wrapper
+
+
 class Server:
     def __init__(self, port):
         # Communication socket
@@ -40,10 +49,21 @@ class Server:
         # Client authentication
         self.clients = {}
 
+        # Vote application
+        self.groups = {}
+
         # Shutdown handling
         self.stop_event = threading.Event()
         signal.signal(signal.SIGINT, self.__shutdown)
         signal.signal(signal.SIGTERM, self.__shutdown)
+
+    def is_authenticated(self, msg):
+        cid = msg.get("id")
+        token = msg.get("token")
+        return cid in self.clients and self.clients[cid] == token
+
+    def send_error(self, addr, err):
+        self.__send(addr, {"type": "ERROR", "error": err})
 
     def __log(self, msg):
         print(f"[SERVER] {msg}")
@@ -254,6 +274,30 @@ class Server:
         self.clients[cid] = token
         self.__send(addr, {"type": "REGISTER_OK", "token": token})
 
+    @requires_auth
+    def __create_group(self, msg, addr):
+        cid = msg.get("id")
+        name = msg.get("group")
+
+        if cid is None:
+            self.__log(f"Error: Expected key 'id': {msg}")
+            return
+
+        if name is None:
+            self.__log(f"Error: Expected key 'group': {msg}")
+            return
+
+        if name in self.groups:
+            self.__log(f"Error: Group already exists: {name}")
+            return
+
+        self.groups[name] = {
+            "owner": cid,
+            "members": {cid}
+        }
+        
+        self.__send(addr, {"type": "CREATE_GROUP_OK", "group": name})
+
     def __handle_message(self, msg, addr):
         t = msg.get("type")
         if t == "HS_ELECTION":
@@ -268,6 +312,9 @@ class Server:
         elif t == "REGISTER":
             self.__log("Got: REGISTER")
             self.__register(msg, addr)
+        elif t == "CREATE_GROUP":
+            self.__log("Got: CREATE_GROUP")
+            self.__create_group(msg, addr)
         else:
             self.__log(f"Error: Got invalid message: {msg}")
 

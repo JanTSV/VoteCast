@@ -65,6 +65,15 @@ class Client:
             "id": self.id
         })
 
+    def __create_group(self, name):
+        self.__send({
+            "type": "CREATE_GROUP",
+            "id": self.id,
+            "token": self.token,
+            "group": name
+        })
+        print(self.__recv())
+
     def register(self):
         self.__log("Registering client...")
 
@@ -111,7 +120,8 @@ class Client:
             elif choice == 3:
                 pass
             elif choice == 4:
-                return
+                name = input("Group name: ")
+                self.__create_group(name)
             elif choice == 5:
                 return
             elif choice == 6:
