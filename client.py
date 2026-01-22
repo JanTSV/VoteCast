@@ -113,6 +113,14 @@ class Client:
         })
         print(self.__recv())
 
+    def __joined_groups(self):
+        self.__send({
+            "type": "JOINED_GROUPS",
+            "id": self.id,
+            "token": self.token
+        })
+        print(self.__recv())
+
     def run(self):
         if self.leader is None:
             self.__log("Error: No leader")
@@ -134,7 +142,7 @@ class Client:
             elif choice == 2:
                 self.__get_groups()
             elif choice == 3:
-                pass
+                self.__joined_groups()
             elif choice == 4:
                 name = input("Group name: ")
                 self.__create_group(name)

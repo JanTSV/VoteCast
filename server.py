@@ -323,6 +323,17 @@ class Server:
         self.groups[name]["members"].add(cid)
         self.__send(addr, {"type": "JOIN_GROUP_OK", "group": name})
 
+    @requires_auth
+    def __joined_groups(self, msg, addr):
+        cid = msg.get("id")
+
+        if cid is None:
+            self.__log(f"Error: Expected key 'id': {msg}")
+            return
+
+        groups = [g for g in self.groups.keys() if cid in self.groups[g]["members"]]
+        self.__send(addr, {"type": "JOINED_GROUPS_OK", "groups": groups})
+
     def __handle_message(self, msg, addr):
         t = msg.get("type")
         if t == "HS_ELECTION":
@@ -346,6 +357,9 @@ class Server:
         elif t == "JOIN_GROUP":
             self.__log("Got: JOIN_GROUP")
             self.__join_group(msg, addr)
+        elif t == "JOINED_GROUPS":
+            self.__log("Got: JOINED_GROUPS")
+            self.__joined_groups(msg, addr)
         else:
             self.__log(f"Error: Got invalid message: {msg}")
 
