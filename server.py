@@ -64,6 +64,31 @@ class Server:
         signal.signal(signal.SIGINT, self.__shutdown)
         signal.signal(signal.SIGTERM, self.__shutdown)
 
+    def __send_replicate_state(self, new_leader):
+        # Ensure all sets are converted to lists before sending
+        state = {
+            "type": "REPL_STATE",
+            "clients": {cid: {"token": client["token"], "addr": client["addr"]} for cid, client in self.clients.items()},
+            "groups": {name: {"owner": group["owner"], "members": list(group["members"])} for name, group in self.groups.items()},
+            "votes": self.votes,
+            "S": self.S,
+            "fo_pending": self.fo_pending,
+        }
+        self.__leader_send(new_leader, state)
+
+    def __replicate_state(self, msg):
+        # Convert sets to lists
+        self.clients = {cid: {"token": client["token"], "addr": client["addr"]} for cid, client in msg["clients"].items()}
+        
+        self.groups = {name: {
+            "owner": group["owner"],
+            "members": list(group["members"])
+        } for name, group in msg["groups"].items()}
+
+        self.votes = msg["votes"]
+        self.S = msg["S"]
+        self.fo_pending = msg["fo_pending"]
+
     def is_authenticated(self, msg):
         cid = msg.get("id")
         token = msg.get("token")
@@ -280,6 +305,11 @@ class Server:
         if cid is None:
             self.__log(f"Error: Expected key 'id': {msg}")
             return
+        
+        # If this server was the leader before,
+        # replicate its whole state to the new leader.
+        if self.is_leader and cid != self.id:
+            self.__send_replicate_state(cid)
 
         self.leader = cid
         self.is_leader = (self.leader == self.id)
@@ -612,13 +642,16 @@ class Server:
 
             # Increment the sequence number after adding it to pending
             self.S[group] += 1
+        elif t == "REPL_STATE":
+            self.__log("Got: REPL_STATE")
+            self.__replicate_state(msg)
         else:
             self.__log(f"Error: Got invalid message: {msg}")
 
         # Leader multicasts all incoming requests to 
         # non leader servers so that they can continue
         # in the case he fails / crashes.
-        if self.is_leader and t not in ["HS_ELECTION", "HS_REPLY", "HS_LEADER", "REGISTER", "START_VOTE"]:
+        if self.is_leader and t not in ["HS_ELECTION", "HS_REPLY", "HS_LEADER", "REGISTER", "START_VOTE", "REPL_STATE"]:
             for server in self.servers:
                 if server != self.id:
                     self.__leader_send(server, msg)
