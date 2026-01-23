@@ -386,8 +386,8 @@ class Server:
         """
         FO-multicast(g, m):
         - piggyback S_pg
-        - B-multicast
         - increment S_pg
+        - B-multicast
         """
         seq = self.S[group]
 
@@ -406,6 +406,9 @@ class Server:
             "msg": msg,
             "vote_id": payload["vote_id"]
         }
+
+        # Increment S_pg
+        self.S[group] += 1
 
         # B-multicast
         for cid in pending:
@@ -579,7 +582,7 @@ class Server:
             now = time.time()
             finished = []
 
-            for key, entry in self.fo_pending.items():
+            for key, entry in list(self.fo_pending.items()):
                 group, seq = key
 
                 if now > entry["deadline"] or not entry["pending"]:
@@ -592,9 +595,6 @@ class Server:
             for key in finished:
                 group, seq = key
                 entry = self.fo_pending.pop(key)
-
-                # Increment S
-                self.S[group] += 1
 
                 vote_id = entry.get("vote_id")
                 if vote_id:

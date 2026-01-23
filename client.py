@@ -302,8 +302,7 @@ class Client:
                     print("No pending votes")
                     continue
                 
-                answered = []
-                for vote_id, vote_info in self.pending_votes.items():
+                for vote_id, vote_info in list(self.pending_votes.items()):
                     if vote_info["answered"]:
                         print(f"Already replied for {vote_id}")
                         continue
