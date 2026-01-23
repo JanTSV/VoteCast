@@ -6,6 +6,7 @@ import signal
 import click
 import secrets
 import uuid
+from collections import defaultdict
 
 from config import MCAST_GRP, MCAST_PORT, BUF
 
@@ -56,6 +57,7 @@ class Server:
 
         # FO reliable multicast S^p_g
         self.S = {}
+        self.fo_pending = {}
 
         # Shutdown handling
         self.stop_event = threading.Event()
@@ -396,27 +398,18 @@ class Server:
         }
 
         pending = set(self.groups[group]["members"])
-        deadline = time.time() + timeout
+
+        # Buffer pending requests
+        self.fo_pending[(group, seq)] = {
+            "pending": set(self.groups[group]["members"]),
+            "deadline": time.time() + timeout,
+            "msg": msg,
+            "vote_id": payload["vote_id"]
+        }
 
         # B-multicast
-        while pending and time.time() < deadline:
-            for cid in pending:
-                addr = self.clients[cid]["addr"]
-                self.__send(addr, msg)
-            
-            # Collect replies
-            try:
-                data, _ = self.sock.recvfrom(BUF)
-                reply = json.loads(data.decode())
-                if reply.get("type") == "VOTE_ACK":
-                    self.__vote_ack(reply, addr)
-                    pending.discard(reply["id"])
-            except socket.timeout:
-                pass
-
-        # Increment S_pg
-        self.S[group] += 1
-        print("FO MC DONE")
+        for cid in pending:
+            self.__send(self.clients[cid]["addr"], msg)
 
     @requires_auth
     def __start_vote(self, msg, addr):
@@ -476,6 +469,31 @@ class Server:
         }
         self.__fo_multicast(name, payload, timeout)
 
+    @requires_auth
+    def __vote_ack(self, msg, addr):
+        vote_id = msg.get("vote_id")
+        group = msg.get("group")
+        sender_seq = msg.get("S")
+
+        if not vote_id or not group or sender_seq is None:
+            self.__log(f"Error in VOTE_ACK: Missing vote_id, group, or S")
+            return
+
+        # Find the pending FO multicast entry for that sequence
+        fo_entry = self.fo_pending.get((group, sender_seq))
+        if not fo_entry:
+            self.__log(f"Out-of-order or unknown VOTE_ACK for {group}, seq={sender_seq}")
+            return
+
+        # Remove sender from pending
+        sender_id = msg.get("id")
+        if sender_id in fo_entry["pending"]:
+            fo_entry["pending"].remove(sender_id)
+
+        # Record the vote
+        self.votes[vote_id]["votes"].append(msg)
+        self.__log(f"Vote Acknowledged: {msg}")
+
     def __handle_message(self, msg, addr):
         t = msg.get("type")
         if t == "HS_ELECTION":
@@ -505,10 +523,12 @@ class Server:
         elif t == "LEAVE_GROUP":
             self.__log("Got: LEAVE_GROUP")
             self.__leave_group(msg, addr)
-            self.__joined_groups(msg, addr)
         elif t == "START_VOTE":
             self.__log("Got: START_VOTE")
             self.__start_vote(msg, addr)
+        elif t == "VOTE_ACK":
+            self.__log("Got: VOTE_ACK")
+            self.__vote_ack(msg, addr)
         else:
             self.__log(f"Error: Got invalid message: {msg}")
 
@@ -525,6 +545,65 @@ class Server:
             except socket.timeout:
                 continue
 
+    def __finalize_vote(self, vote_id):
+        self.__log(f"Finalizing vote {vote_id}")
+
+        vote = self.votes.get(vote_id)
+        if not vote:
+            self.__log(f"Vote {vote_id} not found")
+            return
+
+        # Select winner
+        winner = "No votes, no winner"
+        if len(vote["votes"]) > 0:
+            vote_counts = defaultdict(int)
+            for vote_entry in vote["votes"]:
+                vote_counts[vote_entry["vote"]] += 1
+
+            winner = max(vote_counts, key=vote_counts.get)
+
+        # Announce the result via group multicast
+        result_msg = {
+            "type": "VOTE_RESULT",
+            "vote_id": vote_id,
+            "group": vote["group"],
+            "topic": vote["topic"],
+            "winner": winner
+        }
+
+        for cid in self.groups[vote["group"]]["members"]:
+            self.__send(self.clients[cid]["addr"], result_msg)
+
+    def __fo_retransmit_loop(self):
+        while not self.stop_event.is_set():
+            now = time.time()
+            finished = []
+
+            for key, entry in self.fo_pending.items():
+                group, seq = key
+
+                if now > entry["deadline"] or not entry["pending"]:
+                    finished.append(key)
+                    continue
+
+                for cid in entry["pending"]:
+                    self.__send(self.clients[cid]["addr"], entry["msg"])
+
+            for key in finished:
+                group, seq = key
+                entry = self.fo_pending.pop(key)
+
+                # Increment S
+                self.S[group] += 1
+
+                vote_id = entry.get("vote_id")
+                if vote_id:
+                    self.__finalize_vote(vote_id)
+
+                self.__log(f"FO multicast completed: {group}, seq={seq}")
+
+            time.sleep(0.5)
+
     def run(self):
         # Discovery via multicast in other threads
         discovery_thread = threading.Thread(target=self.__discovery_service)
@@ -536,6 +615,10 @@ class Server:
         # CLI is in another thread to not interrupt the server
         message_thread = threading.Thread(target=self.__message_handling)
         message_thread.start()
+
+        # FO multicast thread
+        retransmit_thread = threading.Thread(target=self.__fo_retransmit_loop)
+        retransmit_thread.start()
 
         # CLI
         while not self.stop_event.is_set():
@@ -560,6 +643,7 @@ class Server:
         discovery_thread.join()
         broadcast_thread.join()
         message_thread.join()
+        retransmit_thread.join()
         self.sock.close()
         self.mcast.close()
         self.__log("Shutdown")

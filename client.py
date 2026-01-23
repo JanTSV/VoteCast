@@ -25,6 +25,7 @@ class Client:
         # FO reliable multicast R^q_g and FIFO
         self.R = {}
         self.hold_back = {}
+        self.pending_votes = {}
 
         # Shutdown handling
         self.stop_event = threading.Event()
@@ -151,24 +152,37 @@ class Client:
             "token": self.token
         })
 
-    def __fo_deliver(self, g, q, msg):
-        # TODO: save vote so that client can answer in CLI
+    def __add_vote_request(self, g, q, msg):
         S = msg["S"]
         self.R[g][q] = S
 
-    def __send_fo_ack(self, g, q, S, vote):
-         ip, port = q.split(":")
-         # TODO: self.__send to leader
-         self.sock.sendto(json.dumps({
+        vote_id = msg.get("vote_id")
+        if vote_id and vote_id not in self.pending_votes:
+            # Save vote so that client can answer in CLI
+            self.pending_votes[vote_id] = {
+                "group": g,
+                "topic": msg.get("topic"),
+                "options": msg.get("options"),
+                "sender": q,
+                "answered": False,
+                "S": S
+            }
+            self.__log(f"New vote available for {g}: {msg.get('topic')} (Vote ID: {vote_id}, S={S})")
+
+    def __send_vote_ack(self, g, vote_id, vote, S):
+        # TODO: Send to leader?
+        ip, port = self.leader.split(":")
+        msg = {
             "type": "VOTE_ACK",
             "group": g,
-            "sender": q,
-            "seq": S,
+            "vote_id": vote_id,
+            "S": S,
             "id": self.id,
             "vote": vote,
-            "id": self.id,
             "token": self.token
-        }).encode(), (ip, int(port)))
+        }
+        self.sock.sendto(json.dumps(msg).encode(), (ip, int(port)))
+        self.__log(f"Sent VOTE_ACK for vote {vote_id} to leader")
 
     def __vote(self, msg):
         g = msg["group"]
@@ -186,24 +200,33 @@ class Client:
 
         R_qg = self.R[g][q]
         
+        # Handle requests in FIFO
         if S == R_qg + 1:
-            self.__fo_deliver(g, q, msg)
+            self.__add_vote_request(g, q, msg)
 
             while (self.R[g][q] + 1) in self.hold_back[g][q]:
                 next_seq = self.R[g][q] + 1
                 buffered = self.hold_back[g][q].pop(next_seq)
-                self.__fo_deliver(g, q, buffered)
+                self.__add_vote_request(g, q, buffered)
 
         elif S > R_qg + 1:
             self.hold_back[g][q][S] = msg
 
-        self.__send_fo_ack(g, q, S, "McDonalds")
+    def __vote_result(self, msg):
+        vote_id = msg.get("vote_id")
+        if vote_id in self.pending_votes:
+            self.__log(f"Vote finished: {vote_id}, result: {msg.get('winner')}")
+            del self.pending_votes[vote_id]
+        else:
+            self.__log(f"Error: Received result for unknown vote_id: {vote_id}")
 
     def __handle_message(self, msg, addr):
         t = msg.get("type")
         
         if t == "VOTE":
             self.__vote(msg)
+        elif t == "VOTE_RESULT":
+            self.__vote_result(msg)
         else:
             self.__log(f"Got message: {msg}")
 
@@ -227,10 +250,6 @@ class Client:
         message_thread = threading.Thread(target=self.__message_handling)
         message_thread.start()
 
-        # TODO: Remove test
-        self.__create_group("Test")
-        self.__start_vote("Test", "Essen", ["McDonalds", "Burger King"], 30)
-
         # CLI
         while not self.stop_event.is_set():
             print("\n--- Menu ---")
@@ -241,7 +260,8 @@ class Client:
             print("5) Join group")
             print("6) Leave group")
             print("7) Start vote")
-            print("8) Exit")
+            print("8) Vote")
+            print("9) Exit")
             choice = int(input("Choose: "))
             if choice == 1:
                 print(f"Leader: {self.leader}")
@@ -261,7 +281,11 @@ class Client:
             elif choice == 7:
                 name = input("Group name: ")
                 topic = input("Topic: ")
-                timeout = int(input("Timeout: "))
+                timeout = 30
+                try:
+                    timeout = int(input("Timeout: "))
+                except:
+                    print(f"Invalid timeout, default={timeout}")
                 options = []
                 stop = False
                 i = 0
@@ -274,7 +298,40 @@ class Client:
                         options.append(option)
                 self.__start_vote(name, topic, options, timeout)
             elif choice == 8:
-                return
+                if not self.pending_votes:
+                    print("No pending votes")
+                    continue
+                
+                answered = []
+                for vote_id, vote_info in self.pending_votes.items():
+                    if vote_info["answered"]:
+                        print(f"Already replied for {vote_id}")
+                        continue
+                    vote_info["answered"] = True
+                    print(f"Vote ID: {vote_id}")
+                    print(f"  Group: {vote_info['group']}")
+                    print(f"  Topic: {vote_info['topic']}")
+                    print(f"  Options: {', '.join(vote_info['options'])}")
+                    print(f"  Sender: {vote_info['sender']}")
+                    print("  --")
+                    vote = None
+                    while vote is None:
+                        v = input("Your vote: ")
+                        if v in vote_info['options']:
+                            vote = v
+                        else:
+                            print(f"{v} is not a valid option!")
+
+                    # Send vote to server
+                    self.__send_vote_ack(
+                        g=vote_info["group"],
+                        vote_id=vote_id,
+                        vote=vote,
+                        S=vote_info["S"]
+                    )
+
+            elif choice == 9:
+                self.stop_event.set()
             else:
                 print("Invalid choice")
 
