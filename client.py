@@ -146,6 +146,10 @@ class Client:
         if self.leader is None:
             self.__log("Error: No leader")
 
+        # TODO: Remove test
+        self.__create_group("Test")
+        self.__start_vote("Test", "Essen", ["McDonalds", "Burger King"], 30)
+
         # CLI
         while True:
             print("\n--- Menu ---")

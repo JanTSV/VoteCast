@@ -54,6 +54,9 @@ class Server:
         self.groups = {}
         self.votes = {}
 
+        # FO reliable multicast
+        self.S = {}
+
         # Shutdown handling
         self.stop_event = threading.Event()
         signal.signal(signal.SIGINT, self.__shutdown)
@@ -301,10 +304,14 @@ class Server:
             self.__log(f"Error: Group already exists: {name}")
             return
 
+        # Create group
         self.groups[name] = {
             "owner": cid,
             "members": {cid}
         }
+
+        # Initialize sequence counter for group
+        self.S[name] = 0
         
         self.__send(addr, {"type": "CREATE_GROUP_OK", "group": name})
 
@@ -368,27 +375,46 @@ class Server:
         self.groups[name]["members"].remove(cid)
         self.__send(addr, {"type": "LEAVE_GROUP_OK", "group": name})
 
-    def __reliable_multicast(self, members, msg, timeout):
-        pending = set(members)
+    @requires_auth
+    def __vote_ack(self, msg, addr):
+        print("HERE: ", msg)
 
-        while pending:
-            for cid in list(pending):
+    def __fo_multicast(self, group, payload, timeout):
+        """
+        FO-multicast(g, m):
+        - piggyback S_pg
+        - B-multicast
+        - increment S_pg
+        """
+        seq = self.S[group]
+
+        msg = {
+            "type": "VOTE",
+            "S": seq,
+            **payload
+        }
+
+        pending = set(self.groups[group]["members"])
+        deadline = time.time() + timeout
+
+        # B-multicast
+        while pending and time.time() < deadline:
+            for cid in pending:
                 addr = self.clients[cid]["addr"]
                 self.__send(addr, msg)
+            
+            # Collect replies
+            try:
+                data, _ = self.sock.recvfrom(BUF)
+                reply = json.loads(data.decode())
+                if reply.get("type") == "VOTE_ACK":
+                    self.__vote_ack(reply, addr)
+            except socket.timeout:
+                pass
 
-            start = time.time()
-            while time.time() - start < timeout:
-                try:
-                    data, addr = self.sock.recvfrom(BUF)
-                    reply = json.loads(data.decode())
-
-                    if reply.get("type") == "VOTE_ACK":
-                        cid = reply.get("id")
-                        if cid in pending:
-                            pending.remove(cid)
-
-                except socket.timeout:
-                    break
+        # Increment S_pg
+        self.S[group] += 1
+        print("FO MC DONE")
 
     @requires_auth
     def __start_vote(self, msg, addr):
@@ -429,21 +455,17 @@ class Server:
         self.__send(addr, {"type": "START_VOTE_OK", "group": name, "topic": topic, "options": options, "timeout": timeout})
 
         vote_id = str(uuid.uuid4())
+
+        # Create entry for the vote
         self.votes[vote_id] = {
             "group": name,
             "topic": topic,
             "options": options,
-            "votes": {}
+            "votes": []
         }
-        members = self.groups[name]["members"]
-        vote_msg = {
-            "type": "VOTE",
-            "vote_id": vote_id,
-            "group": name,
-            "topic": topic,
-            "options": options
-        }
-        self.__reliable_multicast(members, vote_msg, timeout)
+
+        # FO reliable multicast it to the group
+        self.__fo_multicast(name, {"vote_id": vote_id, "topic": topic, "options": options}, timeout)
 
     def __handle_message(self, msg, addr):
         t = msg.get("type")
