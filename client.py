@@ -227,6 +227,9 @@ class Client:
             self.__vote(msg)
         elif t == "VOTE_RESULT":
             self.__vote_result(msg)
+        elif t == "NEW_LEADER":
+            self.leader = msg["id"]
+            self.__log(f"Got a new leader: {self.leader}")
         else:
             self.__log(f"Got message: {msg}")
 

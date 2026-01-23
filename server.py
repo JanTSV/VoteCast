@@ -78,7 +78,7 @@ class Server:
 
     def __replicate_state(self, msg):
         # Convert sets to lists
-        self.clients = {cid: {"token": client["token"], "addr": client["addr"]} for cid, client in msg["clients"].items()}
+        self.clients = {cid: {"token": client["token"], "addr": tuple(client["addr"])} for cid, client in msg["clients"].items()}
         
         self.groups = {name: {
             "owner": group["owner"],
@@ -88,6 +88,10 @@ class Server:
         self.votes = msg["votes"]
         self.S = msg["S"]
         self.fo_pending = msg["fo_pending"]
+
+        # Tell clients that this is the new leader
+        for cid, client in self.clients.items():
+            self.__leader_send(client["addr"], {"type": "NEW_LEADER", "id": self.id})
 
     def is_authenticated(self, msg):
         cid = msg.get("id")
