@@ -83,6 +83,10 @@ class Server:
         }
         self.__leader_send(new_leader, state)
 
+    def __tell_clients_about_new_leader(self):
+        for cid, client in self.clients.items():
+            self.__leader_send(client["addr"], {"type": "NEW_LEADER", "id": self.id})
+
     def __replicate_state(self, msg):
         # Convert sets to lists
         self.clients = {cid: {"token": client["token"], "addr": tuple(client["addr"])} for cid, client in msg["clients"].items()}
@@ -97,8 +101,7 @@ class Server:
         self.fo_pending = msg["fo_pending"]
 
         # Tell clients that this is the new leader
-        for cid, client in self.clients.items():
-            self.__leader_send(client["addr"], {"type": "NEW_LEADER", "id": self.id})
+        self.__tell_clients_about_new_leader()
 
     def is_authenticated(self, msg):
         cid = msg.get("id")
@@ -143,9 +146,9 @@ class Server:
                         self.__build_ring()
 
                         # If the server joined itself, start HS
-                        if self.id == sid:
-                            time.sleep(2)  # Needed with >1s so that other servers can discover it
-                            self.__hs_start()
+                        # if self.id == sid:
+                        #     time.sleep(2)  # Needed with >1s so that other servers can discover it
+                        #     self.__hs_start()
                 elif msg == "WHO_IS_LEADER":
                         self.__log(f"Discovery service got leader request")
                         if self.is_leader:
@@ -718,7 +721,7 @@ class Server:
                         self.__handle_message(msg, addr)
                     except Exception as e:
                         self.__log(f"Invalid message: {e}")
-            except socket.timeout:
+            except:
                 continue
 
     def __finalize_vote(self, vote_id):
