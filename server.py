@@ -41,7 +41,7 @@ class Server:
         self.__open_client_side_socket()
 
         # Server-side discovery (HS algorithm)
-        self.servers = set()
+        self.servers = {self.id}
         self.left = None
         self.right = None
         self.leader = None
@@ -49,6 +49,7 @@ class Server:
         self.phase = 0
         self.pending_replies = 0
         self.election_in_progress = False
+        self.election_done = threading.Event()
         self.__open_discovery_socket()
 
         # Client authentication
@@ -70,6 +71,13 @@ class Server:
         self.stop_event = threading.Event()
         signal.signal(signal.SIGINT, self.__shutdown)
         signal.signal(signal.SIGTERM, self.__shutdown)
+
+    def __print_menu(self):
+        print("\n--- Menu ---")
+        print("1) Show discovered servers")
+        print("2) Start HS election")
+        print("3) Show leader")
+        print("4) Exit")
 
     def __send_replicate_state(self, new_leader):
         # Ensure all sets are converted to lists before sending
@@ -118,6 +126,7 @@ class Server:
         self.__log("Opening discovery service")
         self.mcast = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         self.mcast.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.mcast.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         self.mcast.bind(("", MCAST_PORT))
         self.mcast.settimeout(1.0)
         mreq = socket.inet_aton(MCAST_GRP) + socket.inet_aton("0.0.0.0")
@@ -141,9 +150,11 @@ class Server:
                 if msg.startswith("SERVER:"):
                     _, sid = msg.split(":", 1)
                     if sid not in self.servers:
-                        self.__log(f"Discovery service found server: {sid}")
+                        self.__log(f"\033[93mDiscovery service found server: {sid}\033[0m")
                         self.servers.add(sid)
                         self.__build_ring()
+                        if self.leader is None and not self.election_in_progress:
+                            self.__hs_start()
 
                         # If the server joined itself, start HS
                         # if self.id == sid:
@@ -235,7 +246,7 @@ class Server:
         else:
             self.sock.sendto(json.dumps(msg).encode(), server_id)
 
-    def __hs_start(self):
+    def __hs_start(self, *, manual=False):
         if self.election_in_progress:
             self.__log("Election already in progress!")
             return  # avoid starting multiple elections
@@ -244,11 +255,14 @@ class Server:
             self.__build_ring()
             
         self.election_in_progress = True
+        self.election_done.clear()
         self.leader = None
         self.is_leader = False
         self.phase = 0
-        self.__log("Starting Hirschberg-Sinclair election...")
+        self.__log("\033[92mStarting Hirschberg-Sinclair election...\033[0m")
         self.__hs_send_neighbors()
+        if manual:
+            self.election_done.wait(timeout=10)
 
     def __hs_send_neighbors(self):
         distance = 2 ** self.phase
@@ -337,10 +351,11 @@ class Server:
                 self.__hs_send_neighbors()
 
     def __hs_declare_leader(self):
-        self.__log("HS: I am the leader")
+        self.__log("\033[92mHS: I am the leader\033[0m")
         self.leader = self.id
         self.is_leader = True
         self.election_in_progress = False
+        self.election_done.set()
         msg = {"type": "HS_LEADER", "id": self.id}
         self.__send(self.left, msg)
 
@@ -359,7 +374,8 @@ class Server:
         self.leader = cid
         self.is_leader = (self.leader == self.id)
         self.election_in_progress = False
-        self.__log(f"HS: Leader elected: {self.leader}")
+        self.election_done.set()
+        self.__log(f"\033[92mHS: Leader elected: {self.leader}\033[0m")
 
         if self.left != cid:
             self.__send(self.left, msg)
@@ -798,18 +814,20 @@ class Server:
 
         # CLI
         while not self.stop_event.is_set():
-            print("\n--- Menu ---")
-            print("1) Show discovered servers")
-            print("2) Start HS election")
-            print("3) Show leader")
-            print("4) Exit")
-            choice = int(input("Choose: "))
+            self.__print_menu()
+            raw_choice = input("Choose: ").strip()
+            if not raw_choice:
+                continue
+            choice = int(raw_choice)
             if choice == 1:
-                print(f"Servers: {sorted(self.servers)}")
+                print(f"\033[92mServers: {sorted(self.servers)}\033[0m")
+                print()
             elif choice == 2:
-                self.__hs_start()
+                self.__hs_start(manual=True)
+                print()
             elif choice == 3:
-                print(f"Leader: {self.leader}")
+                print(f"\033[92mLeader: {self.leader}\033[0m")
+                print()
             elif choice == 4:
                 self.stop_event.set()
             else:
