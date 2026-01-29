@@ -12,6 +12,13 @@ from config import MCAST_GRP, MCAST_PORT, BUF
 
 
 HEARTBEAT_TIMEOUT = 5.0
+COLOR_GREEN = "\033[92m"
+COLOR_YELLOW = "\033[93m"
+COLOR_RESET = "\033[0m"
+
+
+def color_text(text, color):
+    return f"{color}{text}{COLOR_RESET}"
 
 
 def get_local_ip():
@@ -34,6 +41,8 @@ def requires_auth(fn):
 
 class Server:
     def __init__(self, port):
+        self.log_queue = []
+        self.log_lock = threading.Lock()
         # Communication socket
         self.ip = get_local_ip()
         self.port = port
@@ -120,7 +129,21 @@ class Server:
         self.__send(addr, {"type": "ERROR", "error": err})
 
     def __log(self, msg):
-        print(f"[SERVER] {msg}")
+        with self.log_lock:
+            self.log_queue.append(f"[SERVER] {msg}")
+
+    def __flush_logs(self):
+        with self.log_lock:
+            if not self.log_queue:
+                return
+            for entry in self.log_queue:
+                print(entry)
+            self.log_queue.clear()
+
+    def __log_flush_loop(self):
+        while not self.stop_event.is_set():
+            self.__flush_logs()
+            time.sleep(0.2)
 
     def __open_discovery_socket(self):
         self.__log("Opening discovery service")
@@ -150,16 +173,11 @@ class Server:
                 if msg.startswith("SERVER:"):
                     _, sid = msg.split(":", 1)
                     if sid not in self.servers:
-                        self.__log(f"\033[93mDiscovery service found server: {sid}\033[0m")
+                        self.__log(color_text(f"Discovery service found server: {sid}", COLOR_YELLOW))
                         self.servers.add(sid)
                         self.__build_ring()
                         if self.leader is None and not self.election_in_progress:
                             self.__hs_start()
-
-                        # If the server joined itself, start HS
-                        # if self.id == sid:
-                        #     time.sleep(2)  # Needed with >1s so that other servers can discover it
-                        #     self.__hs_start()
                 elif msg == "WHO_IS_LEADER":
                         self.__log(f"Discovery service got leader request")
                         if self.is_leader:
@@ -259,7 +277,7 @@ class Server:
         self.leader = None
         self.is_leader = False
         self.phase = 0
-        self.__log("\033[92mStarting Hirschberg-Sinclair election...\033[0m")
+        self.__log(color_text("Starting Hirschberg-Sinclair election...", COLOR_GREEN))
         self.__hs_send_neighbors()
         if manual:
             self.election_done.wait(timeout=10)
@@ -351,7 +369,7 @@ class Server:
                 self.__hs_send_neighbors()
 
     def __hs_declare_leader(self):
-        self.__log("\033[92mHS: I am the leader\033[0m")
+        self.__log(color_text("HS: I am the leader", COLOR_GREEN))
         self.leader = self.id
         self.is_leader = True
         self.election_in_progress = False
@@ -375,7 +393,7 @@ class Server:
         self.is_leader = (self.leader == self.id)
         self.election_in_progress = False
         self.election_done.set()
-        self.__log(f"\033[92mHS: Leader elected: {self.leader}\033[0m")
+        self.__log(color_text(f"HS: Leader elected: {self.leader}", COLOR_GREEN))
 
         if self.left != cid:
             self.__send(self.left, msg)
@@ -812,21 +830,25 @@ class Server:
         retransmit_thread = threading.Thread(target=self.__fo_retransmit_loop)
         retransmit_thread.start()
 
+        log_thread = threading.Thread(target=self.__log_flush_loop)
+        log_thread.start()
+
         # CLI
         while not self.stop_event.is_set():
+            self.__flush_logs()
             self.__print_menu()
             raw_choice = input("Choose: ").strip()
             if not raw_choice:
                 continue
             choice = int(raw_choice)
             if choice == 1:
-                print(f"\033[92mServers: {sorted(self.servers)}\033[0m")
+                print(color_text(f"Servers: {sorted(self.servers)}", COLOR_GREEN))
                 print()
             elif choice == 2:
                 self.__hs_start(manual=True)
                 print()
             elif choice == 3:
-                print(f"\033[92mLeader: {self.leader}\033[0m")
+                print(color_text(f"Leader: {self.leader}", COLOR_GREEN))
                 print()
             elif choice == 4:
                 self.stop_event.set()
@@ -838,6 +860,7 @@ class Server:
         broadcast_thread.join()
         message_thread.join()
         retransmit_thread.join()
+        log_thread.join()
         self.sock.close()
         self.mcast.close()
         self.__log("Shutdown")
