@@ -105,6 +105,13 @@ class Server:
         self.COLOR_RESET = COLOR_RESET
         self.color_text = color_text
 
+        # Initialize leader state
+        self.update_leader_state()
+
+        # Start leader state validation loop
+        self.validate_leader_loop_thread = threading.Thread(target=self.__validate_leader_loop)
+        self.validate_leader_loop_thread.start()
+
     def __print_menu(self):
         print("\n--- Menu ---")
         print("1) Show discovered servers")
@@ -155,7 +162,7 @@ class Server:
         self.mcast.settimeout(1.0)
         mreq = socket.inet_aton(MCAST_GRP) + socket.inet_aton("0.0.0.0")
         self.mcast.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-    
+
     def __open_client_side_socket(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((self.ip, self.port))
@@ -164,9 +171,43 @@ class Server:
     def __shutdown(self, *_):
         self.stop_event.set()
 
-    # discovery moved to discovery.py
-    
-    # discovery broadcast moved to discovery.py
+    def update_leader_state(self, crashed_server=None):
+        """Update leader state based on current ring and crashed server."""
+        # If we're the only server, we're the leader
+        if len(self.servers) == 1:
+            self.leader = self.id
+            self.is_leader = True
+            self.log(self.color_text(f"Updated leader: I am the only server, becoming leader", self.COLOR_GREEN))
+            return
+
+        # If current leader is crashed or not in ring, trigger election
+        if self.leader and (self.leader not in self.servers or self.leader == crashed_server):
+            self.log(self.color_text(f"Current leader {self.leader} is invalid, triggering election", self.COLOR_YELLOW))
+            hs_start(self)
+            return
+
+        # If we have a valid leader in the ring, keep it
+        if self.leader and self.leader in self.servers:
+            self.is_leader = (self.leader == self.id)
+            self.log(self.color_text(f"Leader remains valid: {self.leader}", self.COLOR_GREEN))
+
+    def validate_leader_state(self):
+        """Ensure leader state is consistent with current ring state."""
+        if len(self.servers) == 1:
+            if self.leader != self.id or not self.is_leader:
+                self.log(self.color_text("Leader state inconsistent - fixing to self", self.COLOR_RED))
+                self.leader = self.id
+                self.is_leader = True
+        elif self.leader and self.leader not in self.servers:
+            self.log(self.color_text(f"Leader {self.leader} not in ring, triggering election", self.COLOR_RED))
+            hs_start(self)
+        elif self.leader and self.leader in self.servers:
+            self.is_leader = (self.leader == self.id)
+
+    def __validate_leader_loop(self):
+        while not self.stop_event.is_set():
+            self.validate_leader_state()
+            time.sleep(5)  # Validate every 5 seconds
 
     def send_heartbeat(self):
         if self.left is None or self.left == self.id:
@@ -174,8 +215,6 @@ class Server:
             self.heartbeat_ack_received = True
             return
         self.send(self.left, {"type": "HEARTBEAT", "id": self.id})
-
-    # build_ring moved to ring.py
 
     def send(self, server_id, msg):
         if not server_id:
@@ -194,7 +233,7 @@ class Server:
         """
         if not self.is_leader:
             return
-        
+
         if type(server_id) is not tuple:
             ip, port = server_id.split(":")
             self.sock.sendto(json.dumps(msg).encode(), (ip, int(port)))
@@ -321,7 +360,7 @@ class Server:
             # self.__log("Got: HEARTBEAT_ACK")
             sender_id = msg.get("id")
             if sender_id == self.left:
-                # Ackknowledge heartbeat
+                # Acknowledge heartbeat
                 self.last_heartbeat_time = time.time()
                 self.heartbeat_ack_received = True
         else:
