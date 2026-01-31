@@ -9,11 +9,18 @@ import uuid
 from collections import defaultdict
 
 from config import MCAST_GRP, MCAST_PORT, BUF
+from ring import build_ring
+from discovery import discovery_service, discovery_service_broadcast
+from election import hs_start, hs_election, hs_reply, hs_leader
+from replication import send_replicate_state, replicate_state_apply
+from fo_multicast import fo_multicast, fo_retransmit_loop
+import handlers
 
 
 HEARTBEAT_TIMEOUT = 5.0
 COLOR_GREEN = "\033[92m"
 COLOR_YELLOW = "\033[93m"
+COLOR_RED = "\033[91m"
 COLOR_RESET = "\033[0m"
 
 
@@ -76,10 +83,27 @@ class Server:
         self.last_heartbeat_time = time.time()
         self.heartbeat_ack_received = True
 
+        # Server-side fault handling
+        self.client_votes = {}  # Track votes per client per vote_id
+        self.vote_signatures = {}  # Track vote integrity
+
+        # Server-side vote validation
+        self.vote_hashes = {}  # Track vote hashes for integrity
+
         # Shutdown handling
         self.stop_event = threading.Event()
         signal.signal(signal.SIGINT, self.__shutdown)
         signal.signal(signal.SIGTERM, self.__shutdown)
+
+        # Expose constants/utilities for modules
+        self.MCAST_GRP = MCAST_GRP
+        self.MCAST_PORT = MCAST_PORT
+        self.HEARTBEAT_TIMEOUT = HEARTBEAT_TIMEOUT
+        self.COLOR_GREEN = COLOR_GREEN
+        self.COLOR_YELLOW = COLOR_YELLOW
+        self.COLOR_RED = COLOR_RED
+        self.COLOR_RESET = COLOR_RESET
+        self.color_text = color_text
 
     def __print_menu(self):
         print("\n--- Menu ---")
@@ -88,37 +112,15 @@ class Server:
         print("3) Show leader")
         print("4) Exit")
 
-    def __send_replicate_state(self, new_leader):
-        # Ensure all sets are converted to lists before sending
-        state = {
-            "type": "REPL_STATE",
-            "clients": {cid: {"token": client["token"], "addr": client["addr"]} for cid, client in self.clients.items()},
-            "groups": {name: {"owner": group["owner"], "members": list(group["members"])} for name, group in self.groups.items()},
-            "votes": self.votes,
-            "S": self.S,
-            "fo_pending": self.fo_pending,
-        }
-        self.__leader_send(new_leader, state)
+    # Public helpers for modules
+    def log(self, msg):
+        return self.__log(msg)
 
-    def __tell_clients_about_new_leader(self):
-        for cid, client in self.clients.items():
-            self.__leader_send(client["addr"], {"type": "NEW_LEADER", "id": self.id})
+    def leader_send(self, server_id, msg):
+        return self.__leader_send(server_id, msg)
 
-    def __replicate_state(self, msg):
-        # Convert sets to lists
-        self.clients = {cid: {"token": client["token"], "addr": tuple(client["addr"])} for cid, client in msg["clients"].items()}
-        
-        self.groups = {name: {
-            "owner": group["owner"],
-            "members": list(group["members"])
-        } for name, group in msg["groups"].items()}
-
-        self.votes = msg["votes"]
-        self.S = msg["S"]
-        self.fo_pending = msg["fo_pending"]
-
-        # Tell clients that this is the new leader
-        self.__tell_clients_about_new_leader()
+    def send_replicate_state(self, new_leader):
+        return send_replicate_state(self, new_leader)
 
     def is_authenticated(self, msg):
         cid = msg.get("id")
@@ -126,7 +128,7 @@ class Server:
         return cid in self.clients and self.clients[cid]["token"] == token
 
     def send_error(self, addr, err):
-        self.__send(addr, {"type": "ERROR", "error": err})
+        self.send(addr, {"type": "ERROR", "error": err})
 
     def __log(self, msg):
         with self.log_lock:
@@ -146,7 +148,6 @@ class Server:
             time.sleep(0.2)
 
     def __open_discovery_socket(self):
-        self.__log("Opening discovery service")
         self.mcast = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         self.mcast.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.mcast.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
@@ -156,94 +157,30 @@ class Server:
         self.mcast.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
     
     def __open_client_side_socket(self):
-        self.__log("Opening communication socket")
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((self.ip, self.port))
         self.sock.settimeout(1.0)
 
     def __shutdown(self, *_):
-        self.__log("Shutting down...")
         self.stop_event.set()
 
-    def __discovery_service(self):
-        while not self.stop_event.is_set():
-            try:
-                data, addr = self.mcast.recvfrom(1024)
-                msg = data.decode()
-                if msg.startswith("SERVER:"):
-                    _, sid = msg.split(":", 1)
-                    if sid not in self.servers:
-                        self.__log(color_text(f"Discovery service found server: {sid}", COLOR_YELLOW))
-                        self.servers.add(sid)
-                        self.__build_ring()
-                        if self.leader is None and not self.election_in_progress:
-                            self.__hs_start()
-                elif msg == "WHO_IS_LEADER":
-                        self.__log(f"Discovery service got leader request")
-                        if self.is_leader:
-                            self.sock.sendto(f"LEADER:{self.id}".encode(), addr)
-                            self.__log("Replied to leader request")
-                elif msg.startswith("CRASH:"):
-                    self.__log("Crash discovered, rebuild ring")
-                    _, sid = msg.split(":", 1)
-                    self.servers.remove(sid)
-                    self.__build_ring()
-            except socket.timeout:
-                continue
+    # discovery moved to discovery.py
     
-    def __discovery_service_broadcast(self, interval=1.0):
-        self.__log("Starting continuous discovery broadcast thread")
+    # discovery broadcast moved to discovery.py
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
-        msg = f"SERVER:{self.id}".encode()
-
-        while not self.stop_event.is_set():
-            # Broadcast for discovery
-            try:
-                sock.sendto(msg, (MCAST_GRP, MCAST_PORT))
-            except Exception as e:
-                self.__log(f"Error broadcasting discovery: {e}")
-
-            # Heartbeat
-            current_time = time.time()
-            if current_time - self.last_heartbeat_time > HEARTBEAT_TIMEOUT:
-                if self.heartbeat_ack_received:
-                    self.heartbeat_ack_received = False
-                    self.__log(f"Heartbeat timeout for {self.left}, assuming crash.")
-                    try:
-                        sock.sendto(f"CRASH:{self.left}".encode(), (MCAST_GRP, MCAST_PORT))
-                    except Exception as e:
-                        self.__log(f"Error broadcasting heartbeat discovered crash: {e}")
-
-                    time.sleep(2)  # Needed with >1s so that other servers can discover it
-
-                    # Start new HS to get a new leader
-                    self.__hs_start()
-                    
-            self.__send_heartbeat()
-
-            time.sleep(interval)
-
-        sock.close()
-
-    def __send_heartbeat(self):
+    def send_heartbeat(self):
         if self.left is None or self.left == self.id:
             self.last_heartbeat_time = time.time()
             self.heartbeat_ack_received = True
             return
-        self.__send(self.left, {"type": "HEARTBEAT", "id": self.id})
+        self.send(self.left, {"type": "HEARTBEAT", "id": self.id})
 
-    def __build_ring(self):
-        ordered = sorted(self.servers)
-        self.__log(f"Ordered ring: {ordered}")
+    # build_ring moved to ring.py
 
-        idx = ordered.index(self.id)
-        self.left = ordered[(idx - 1) % len(ordered)]
-        self.right = ordered[(idx + 1) % len(ordered)]
-        self.__log(f"Created ring left={self.left}, right={self.right}")
-
-    def __send(self, server_id, msg):
+    def send(self, server_id, msg):
+        if not server_id:
+            self.__log(f"Error: send called with empty server_id for msg {msg}")
+            return
         if type(server_id) is not tuple:
             ip, port = server_id.split(":")
             self.sock.sendto(json.dumps(msg).encode(), (ip, int(port)))
@@ -264,394 +201,47 @@ class Server:
         else:
             self.sock.sendto(json.dumps(msg).encode(), server_id)
 
-    def __hs_start(self, *, manual=False):
-        if self.election_in_progress:
-            self.__log("Election already in progress!")
-            return  # avoid starting multiple elections
-
-        if self.left is None or self.right is None:
-            self.__build_ring()
-            
-        self.election_in_progress = True
-        self.election_done.clear()
-        self.leader = None
-        self.is_leader = False
-        self.phase = 0
-        self.__log(color_text("Starting Hirschberg-Sinclair election...", COLOR_GREEN))
-        self.__hs_send_neighbors()
-        if manual:
-            self.election_done.wait(timeout=10)
-
-    def __hs_send_neighbors(self):
-        distance = 2 ** self.phase
-        self.pending_replies = 2
-
-        for direction in ("LEFT", "RIGHT"):
-            msg = {
-                "type": "HS_ELECTION",
-                "id": self.id,
-                "phase": self.phase,
-                "direction": direction,
-                "hop": distance
-            }
-            neighbor = self.left if direction == "LEFT" else self.right
-            self.__send(neighbor, msg)
-
-    def __hs_election(self, msg):
-        cid = msg.get("id")
-        hop = msg.get("hop")
-        direction = msg.get("direction")
-
-        if cid is None:
-            self.__log(f"Error: Expected key 'id': {msg}")
-            return
-        
-        if hop is None:
-            self.__log(f"Error: Expected key 'hop': {msg}")
-            return
-
-        if direction is None:
-            self.__log(f"Error: Expected key 'direction': {msg}")
-            return
-
-        if direction not in ["LEFT", "RIGHT"]:
-            self.__log(f"Error: Wrong value of 'direction': {direction}")
-            return
-
-        neighbor = self.left if direction == "LEFT" else self.right
-
-        if cid < self.id:
-            # Swallow message from lower IDs or start own election
-            if not self.election_in_progress:
-                self.__hs_start()
-            return
-        
-        if hop > 1:
-            msg["hop"] -= 1
-            self.__send(neighbor, msg)
-        else:
-            reply = {
-                "type": "HS_REPLY",
-                "id": cid,
-                "direction": msg["direction"]
-            }
-            self.__send(neighbor, reply)
-
-    def __hs_reply(self, msg):
-        cid = msg.get("id")
-        direction = msg.get("direction")
-
-        if cid is None:
-            self.__log(f"Error: Expected key 'id': {msg}")
-            return
-
-        if direction is None:
-            self.__log(f"Error: Expected key 'direction': {msg}")
-            return
-
-        if direction not in ["LEFT", "RIGHT"]:
-            self.__log(f"Error: Wrong value of 'direction': {direction}")
-            return
-
-        neighbor = self.left if direction == "LEFT" else self.right
-
-        if cid != self.id:
-            self.__send(neighbor, msg)
-            return
-        
-        self.pending_replies -= 1
-
-        if self.pending_replies == 0:
-            self.phase += 1
-            if 2 ** self.phase >= len(self.servers):
-                self.__hs_declare_leader()
-            else:
-                self.__hs_send_neighbors()
-
-    def __hs_declare_leader(self):
-        self.__log(color_text("HS: I am the leader", COLOR_GREEN))
-        self.leader = self.id
-        self.is_leader = True
-        self.election_in_progress = False
-        self.election_done.set()
-        msg = {"type": "HS_LEADER", "id": self.id}
-        self.__send(self.left, msg)
-
-    def __hs_leader(self, msg):
-        cid = msg.get("id")
-        
-        if cid is None:
-            self.__log(f"Error: Expected key 'id': {msg}")
-            return
-        
-        # If this server was the leader before,
-        # replicate its whole state to the new leader.
-        if self.is_leader and cid != self.id:
-            self.__send_replicate_state(cid)
-
-        self.leader = cid
-        self.is_leader = (self.leader == self.id)
-        self.election_in_progress = False
-        self.election_done.set()
-        self.__log(color_text(f"HS: Leader elected: {self.leader}", COLOR_GREEN))
-
-        if self.left != cid:
-            self.__send(self.left, msg)
+    # HS election moved to election.py
 
     def __register(self, msg, addr):
-        cid = msg.get("id")
-
-        if cid is None:
-            self.__log(f"Error: Expected key 'id': {msg}")
-            return
-
-        token = secrets.token_hex(16)
-        self.clients[cid] = {
-            "token": token,
-            "addr": addr
-        }
-
-        # Replicate to other servers
-        if self.is_leader:
-            for server in self.servers:
-                if server != self.id:
-                    self.__leader_send(server, {
-                        "type": "REPL_REGISTER",
-                        "id": cid,
-                        "token": token,
-                        "addr": addr
-                    })
-
-        self.__leader_send(addr, {"type": "REGISTER_OK", "token": token})
+        handlers.register(self, msg, addr)
 
     @requires_auth
     def __create_group(self, msg, addr):
-        cid = msg.get("id")
-        name = msg.get("group")
-
-        if cid is None:
-            self.__log(f"Error: Expected key 'id': {msg}")
-            return
-
-        if name is None:
-            self.__log(f"Error: Expected key 'group': {msg}")
-            return
-
-        if name in self.groups:
-            self.__log(f"Error: Group already exists: {name}")
-            return
-
-        # Create group
-        self.groups[name] = {
-            "owner": cid,
-            "members": {cid}
-        }
-
-        # Initialize sequence counter for group
-        self.S[name] = 0
-        
-        self.__leader_send(addr, {"type": "CREATE_GROUP_OK", "group": name})
+        handlers.create_group(self, msg, addr)
 
     @requires_auth
     def __get_groups(self, msg, addr):
-        groups = [g for g in self.groups.keys()]
-        self.__leader_send(addr, {"type": "GET_GROUPS_OK", "groups": groups})
+        handlers.get_groups(self, msg, addr)
 
     @requires_auth
     def __join_group(self, msg, addr):
-        cid = msg.get("id")
-        name = msg.get("group")
-
-        if cid is None:
-            self.__log(f"Error: Expected key 'id': {msg}")
-            return
-
-        if name is None:
-            self.__log(f"Error: Expected key 'group': {msg}")
-            return
-
-        if name not in self.groups:
-            self.__log(f"Error: Group does not exist: {name}")
-            return
-
-        self.groups[name]["members"].add(cid)
-        self.__leader_send(addr, {"type": "JOIN_GROUP_OK", "group": name})
+        handlers.join_group(self, msg, addr)
 
     @requires_auth
     def __joined_groups(self, msg, addr):
-        cid = msg.get("id")
-
-        if cid is None:
-            self.__log(f"Error: Expected key 'id': {msg}")
-            return
-
-        groups = [g for g in self.groups.keys() if cid in self.groups[g]["members"]]
-        self.__leader_send(addr, {"type": "JOINED_GROUPS_OK", "groups": groups})
+        handlers.joined_groups(self, msg, addr)
 
     @requires_auth
     def __leave_group(self, msg, addr):
-        cid = msg.get("id")
-        name = msg.get("group")
-
-        if cid is None:
-            self.__log(f"Error: Expected key 'id': {msg}")
-            return
-
-        if name is None:
-            self.__log(f"Error: Expected key 'group': {msg}")
-            return
-
-        if name not in self.groups:
-            self.__log(f"Error: Group does not exist: {name}")
-            return
-
-        if cid not in self.groups[name]["members"]:
-            self.__log(f"Error: Not a member in group {name}")
-            return
-
-        self.groups[name]["members"].remove(cid)
-        self.__leader_send(addr, {"type": "LEAVE_GROUP_OK", "group": name})
-
-    def __fo_multicast(self, group, payload, timeout):
-        """
-        FO-multicast(g, m):
-        - piggyback S_pg
-        - increment S_pg
-        - B-multicast
-        """
-        seq = self.S[group]
-
-        msg = {
-            "S": seq,
-            "sender": self.id,
-            **payload
-        }
-
-        pending = set(self.groups[group]["members"])
-
-        # Buffer pending requests
-        self.fo_pending[(group, seq)] = {
-            "pending": set(self.groups[group]["members"]),
-            "deadline": time.time() + timeout,
-            "msg": msg,
-            "vote_id": payload["vote_id"]
-        }
-
-        # Increment S_pg
-        self.S[group] += 1
-
-        # B-multicast
-        for cid in pending:
-            self.__leader_send(self.clients[cid]["addr"], msg)
+        handlers.leave_group(self, msg, addr)
 
     @requires_auth
     def __start_vote(self, msg, addr):
-        cid = msg.get("id")
-        name = msg.get("group")
-        topic = msg.get("topic")
-        options = msg.get("options")
-        timeout = msg.get("timeout")
-
-        if cid is None:
-            self.__log(f"Error: Expected key 'id': {msg}")
-            return
-
-        if options is None:
-            self.__log(f"Error: Expected key 'options': {msg}")
-            return
-
-        if timeout is None:
-            self.__log(f"Error: Expected key 'timeout': {msg}")
-            return
-
-        if topic is None:
-            self.__log(f"Error: Expected key 'timeout': {msg}")
-            return
-
-        if name is None:
-            self.__log(f"Error: Expected key 'group': {msg}")
-            return
-
-        if name not in self.groups:
-            self.__log(f"Error: Group does not exist: {name}")
-            return
-
-        if cid not in self.groups[name]["members"]:
-            self.__log(f"Error: Not a member in group {name}")
-            return
-
-        self.__leader_send(addr, {"type": "START_VOTE_OK", "group": name, "topic": topic, "options": options, "timeout": timeout})
-
-        vote_id = str(uuid.uuid4())
-
-        # Create entry for the vote
-        self.votes[vote_id] = {
-            "group": name,
-            "topic": topic,
-            "options": options,
-            "votes": []
-        }
-
-        # Replicate vote state to other servers
-        if self.is_leader:
-            for server in self.servers:
-                if server != self.id:
-                    self.__leader_send(server, {
-                        "type": "REPL_VOTE",
-                        "vote_id": vote_id,
-                        "group": name,
-                        "topic": topic,
-                        "options": options,
-                        "timeout": timeout,
-                        "votes": []
-                    })
-
-        # FO reliable multicast it to the group
-        payload = {
-            "type": "VOTE",
-            "vote_id": vote_id,
-            "group": name,
-            "topic": topic,
-            "options": options
-        }
-        self.__fo_multicast(name, payload, timeout)
+        handlers.start_vote(self, msg, addr)
 
     @requires_auth
     def __vote_ack(self, msg, addr):
-        vote_id = msg.get("vote_id")
-        group = msg.get("group")
-        sender_seq = msg.get("S")
-
-        if not vote_id or not group or sender_seq is None:
-            self.__log(f"Error in VOTE_ACK: Missing vote_id, group, or S")
-            return
-
-        # Find the pending FO multicast entry for that sequence
-        fo_entry = self.fo_pending.get((group, sender_seq))
-        if not fo_entry:
-            self.__log(f"Out-of-order or unknown VOTE_ACK for {group}, seq={sender_seq}")
-            return
-
-        # Remove sender from pending
-        sender_id = msg.get("id")
-        if sender_id in fo_entry["pending"]:
-            fo_entry["pending"].remove(sender_id)
-
-        # Record the vote
-        self.votes[vote_id]["votes"].append(msg)
-        self.__log(f"Vote Acknowledged: {msg}")
+        handlers.vote_ack(self, msg, addr)
 
     def __handle_message(self, msg, addr):
         t = msg.get("type")
         if t == "HS_ELECTION":
-            self.__log("Got: HS_ELECTION")
-            self.__hs_election(msg)
+            hs_election(self, msg)
         elif t == "HS_REPLY":
-            self.__log("Got: HS_REPLY")
-            self.__hs_reply(msg)
+            hs_reply(self, msg)
         elif t == "HS_LEADER":
-            self.__log("Got: HS_LEADER")
-            self.__hs_leader(msg)
+            hs_leader(self, msg)
         elif t == "REGISTER":
             self.__log("Got: REGISTER")
             self.__register(msg, addr)
@@ -723,10 +313,10 @@ class Server:
             self.S[group] += 1
         elif t == "REPL_STATE":
             self.__log("Got: REPL_STATE")
-            self.__replicate_state(msg)
+            replicate_state_apply(self, msg)
         elif t == "HEARTBEAT":
             # self.__log("Got: HEARTBEAT")
-            self.__send(addr, {"type": "HEARTBEAT_ACK", "id": self.id})
+            self.send(addr, {"type": "HEARTBEAT_ACK", "id": self.id})
         elif t == "HEARTBEAT_ACK":
             # self.__log("Got: HEARTBEAT_ACK")
             sender_id = msg.get("id")
@@ -737,15 +327,7 @@ class Server:
         else:
             self.__log(f"Error: Got invalid message: {msg}")
 
-        # Leader multicasts all incoming requests to 
-        # non leader servers so that they can continue
-        # in the case he fails / crashes.
-        if self.is_leader and t not in ["HS_ELECTION", "HS_REPLY", "HS_LEADER", "REGISTER", "START_VOTE", "REPL_STATE"]:
-            for server in self.servers:
-                if server != self.id:
-                    self.__leader_send(server, msg)
-
-    def __message_handling(self):
+    def message_handling(self):
         while not self.stop_event.is_set():
             try:
                 data, addr = self.sock.recvfrom(BUF)
@@ -758,76 +340,20 @@ class Server:
             except:
                 continue
 
-    def __finalize_vote(self, vote_id):
-        self.__log(f"Finalizing vote {vote_id}")
-
-        vote = self.votes.get(vote_id)
-        if not vote:
-            self.__log(f"Vote {vote_id} not found")
-            return
-
-        # Select winner
-        winner = "No votes, no winner"
-        if len(vote["votes"]) > 0:
-            vote_counts = defaultdict(int)
-            for vote_entry in vote["votes"]:
-                vote_counts[vote_entry["vote"]] += 1
-
-            winner = max(vote_counts, key=vote_counts.get)
-
-        # Announce the result via group multicast
-        result_msg = {
-            "type": "VOTE_RESULT",
-            "vote_id": vote_id,
-            "group": vote["group"],
-            "topic": vote["topic"],
-            "winner": winner
-        }
-
-        for cid in self.groups[vote["group"]]["members"]:
-            self.__leader_send(self.clients[cid]["addr"], result_msg)
-
-    def __fo_retransmit_loop(self):
-        while not self.stop_event.is_set():
-            now = time.time()
-            finished = []
-
-            for key, entry in list(self.fo_pending.items()):
-                group, seq = key
-
-                if now > entry["deadline"] or not entry["pending"]:
-                    finished.append(key)
-                    continue
-
-                for cid in entry["pending"]:
-                    self.__leader_send(self.clients[cid]["addr"], entry["msg"])
-
-            for key in finished:
-                group, seq = key
-                entry = self.fo_pending.pop(key)
-
-                vote_id = entry.get("vote_id")
-                if vote_id:
-                    self.__finalize_vote(vote_id)
-
-                self.__log(f"FO multicast completed: {group}, seq={seq}")
-
-            time.sleep(0.5)
-
     def run(self):
         # Discovery via multicast in other threads
-        discovery_thread = threading.Thread(target=self.__discovery_service)
+        discovery_thread = threading.Thread(target=discovery_service, args=(self,))
         discovery_thread.start()
 
-        broadcast_thread = threading.Thread(target=self.__discovery_service_broadcast)
+        broadcast_thread = threading.Thread(target=discovery_service_broadcast, args=(self,))
         broadcast_thread.start()
 
         # CLI is in another thread to not interrupt the server
-        message_thread = threading.Thread(target=self.__message_handling)
+        message_thread = threading.Thread(target=self.message_handling)
         message_thread.start()
 
         # FO multicast thread
-        retransmit_thread = threading.Thread(target=self.__fo_retransmit_loop)
+        retransmit_thread = threading.Thread(target=fo_retransmit_loop, args=(self,))
         retransmit_thread.start()
 
         log_thread = threading.Thread(target=self.__log_flush_loop)
@@ -845,7 +371,7 @@ class Server:
                 print(color_text(f"Servers: {sorted(self.servers)}", COLOR_GREEN))
                 print()
             elif choice == 2:
-                self.__hs_start(manual=True)
+                hs_start(self, manual=True)
                 print()
             elif choice == 3:
                 print(color_text(f"Leader: {self.leader}", COLOR_GREEN))
