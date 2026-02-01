@@ -51,6 +51,18 @@ class Client:
         ip, port = self.leader.split(":")
         self.sock.sendto(json.dumps(msg).encode(), (ip, int(port)))
 
+        # Wait for response
+        try:
+            data, _ = self.sock.recvfrom(BUF)
+            if data:
+                try:
+                    reply = json.loads(data.decode())
+                    self.__handle_message(reply, None)
+                except Exception as e:
+                    self.__log(f"Invalid response: {e}")
+        except socket.timeout:
+            self.__log("Error: No response from server")
+
     def __recv(self):
         data, _ = self.sock.recvfrom(BUF)
         return json.loads(data.decode())
@@ -189,7 +201,7 @@ class Client:
         # TODO: Do we need sender?
         q = msg["sender"]
         S = msg["S"]
-        
+
         if g not in self.R:
             self.R[g] = {}
             self.hold_back[g] = {}
@@ -199,7 +211,7 @@ class Client:
             self.hold_back[g][q] = {}
 
         R_qg = self.R[g][q]
-        
+
         # Handle requests in FIFO
         if S == R_qg + 1:
             self.__add_vote_request(g, q, msg)
@@ -212,6 +224,36 @@ class Client:
         elif S > R_qg + 1:
             self.hold_back[g][q][S] = msg
 
+    def __handle_response(self, msg):
+        t = msg.get("type")
+        if t == "GET_GROUPS_OK":
+            groups = msg.get("groups", [])
+            print(f"Available groups: {', '.join(groups) if groups else 'No groups available'}")
+        elif t == "JOINED_GROUPS_OK":
+            groups = msg.get("groups", [])
+            print(f"Joined groups: {', '.join(groups) if groups else 'No groups joined'}")
+        elif t == "CREATE_GROUP_OK":
+            group = msg.get("group")
+            print(f"Group '{group}' created successfully")
+        elif t == "JOIN_GROUP_OK":
+            group = msg.get("group")
+            print(f"Joined group '{group}' successfully")
+        elif t == "LEAVE_GROUP_OK":
+            group = msg.get("group")
+            print(f"Left group '{group}' successfully")
+        elif t == "START_VOTE_OK":
+            group = msg.get("group")
+            topic = msg.get("topic")
+            options = msg.get("options")
+            print(f"Vote started in group '{group}' on topic '{topic}' with options: {', '.join(options)}")
+        elif t == "REGISTER_OK":
+            print("Registration successful")
+        elif t == "ERROR":
+            error = msg.get("error")
+            print(f"Error: {error}")
+        else:
+            self.__log(f"Got unknown response: {msg}")
+
     def __vote_result(self, msg):
         vote_id = msg.get("vote_id")
         if vote_id in self.pending_votes:
@@ -222,7 +264,7 @@ class Client:
 
     def __handle_message(self, msg, addr):
         t = msg.get("type")
-        
+
         if t == "VOTE":
             self.__vote(msg)
         elif t == "VOTE_RESULT":
@@ -231,7 +273,7 @@ class Client:
             self.leader = msg["id"]
             self.__log(f"Got a new leader: {self.leader}")
         else:
-            self.__log(f"Got message: {msg}")
+            self.__handle_response(msg)
 
     def __message_handling(self):
         while not self.stop_event.is_set():
